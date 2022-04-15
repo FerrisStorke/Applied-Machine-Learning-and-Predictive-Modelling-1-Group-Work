@@ -1,0 +1,1110 @@
+---
+title: "Applied Machine Learning and Predictive Modelling - Stroke Prediction: 11 clinical features for predicting stroke events"
+author: "Ferris Storke, Lukas Große Westermann, Lukas Hürlimann, Marco Ruhstaller"
+date: "11/6/2021"
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### **1. Introduction**
+
+\
+Our group analysed the dataset "**Stroke Prediction - 11 clinical features for predicting stroke events"**, which was found on Kaggle (<https://www.kaggle.com/fedesoriano/stroke-prediction-dataset>). The development of machine learning algorithms to predict strokes could help hospitals and doctors pre-screen patients and ultimately save lives. After downloading the dataset, a shared folder on Switchdrive was created, which all group members could access to share their progress.
+
+##### **1.1 Loading required packages**
+
+\
+First, the packages required for the visualisation and analysis of the data were loaded.
+
+```{r Load packages, echo=TRUE, message=FALSE, warning=FALSE}
+library("DataExplorer")
+library("tidyverse")
+library("MASS")
+library("gridExtra")
+library("corrplot")
+library("caret")
+library("mgcv")
+library("boot")
+library("ROSE")
+library("e1071")
+library("ROCR")
+#library("abc")
+library("multiplex")
+library("scales")
+library("nnet")
+library("gamlss.add")
+library("dplyr")
+library("pROC")
+```
+
+##### **1.2 Loading data and overview**
+
+\
+In a next step, the downloaded CSV-file was loaded. It consists of 5110 patients and their patient ID, gender, age, whether they have hypertension, whether they have a heart disease, marriage status, work type, whether they live in an urban or rural area, glucose level in their blood, body mass index (BMI), whether they are current or former smokers, and whether they had a stroke.
+
+```{r Load file and show structure, echo=TRUE, warning=FALSE}
+# Load dataset
+df <- read.csv("healthcare-dataset-stroke-data.csv", header = TRUE)
+
+# Show structure of the dataset
+str(df)
+```
+
+#### **2. Data Preparation**
+
+##### **2.1 Dropping and transforming variables, and identifying missing values**
+
+\
+The patient ID was dropped as it was not needed for the analysis. Then, the categorical features were encoded as factors and BMI as a numeric feature. The patient without a gender was dropped. The dataframe was then checked for missing values, which revealed that the only missing data were the BMI values for 3.93% of patients.
+
+```{r Drop unneeded columns and transform predictors, echo=TRUE, fig.height=3, fig.width=6, warning=FALSE}
+# Drop unneeded columns and transform predictors
+df$id <- NULL
+df <- df[df$gender != "Other", ]
+df$gender <- as.factor(df$gender)
+df$hypertension<- as.factor(df$hypertension)
+df$heart_disease<- as.factor(df$heart_disease)
+df$ever_married<- as.factor(df$ever_married)
+df$work_type<- as.factor(df$work_type)
+df$Residence_type<- as.factor(df$Residence_type)
+df$smoking_status<- as.factor(df$smoking_status)
+df$bmi<- as.numeric(df$bmi)
+df$stroke<- as.factor(df$stroke)
+
+# Plot missing values of predictors
+plot_missing(df, missing_only = FALSE)
+```
+
+\pagebreak
+
+##### **2.2 Imputing missing BMI values with a linear model** \
+
+###### **2.2.1 Complex linear model including all variables**
+
+In order to impute these missing values, a linear model containing all variables was fitted. Due to limited space and because the simpler linear model will be discussed in more detail, only the adjusted R-Squared is shown here.
+
+```{r Linear Model to Impute Missing BMI values}
+lm.bmi <- lm(bmi ~ ., data = df)
+summary(lm.bmi)$adj.r.squared
+```
+
+The linear model explains 23.75% of the variance of BMI values from the mean.\
+
+###### **2.2.2 Simpler linear model**
+
+Since the adjusted R-Squared of the simple model is pretty low, we fitted a simpler model, using stepwise model selection by AIC.
+
+```{r Stepwise selection of a simple linear model using Akaike Informatoin Criterion (AIC), echo=TRUE}
+lm.bmi.simple <- stepAIC(lm.bmi, direction = "both", trace = FALSE)
+summary(lm.bmi.simple)
+```
+
+\
+The resulting model excludes the patients' gender and whether they lived in a rural or urban area. Patients working for the government (+8.5), never having worked (+5.4), working in the private sector (+8.5), and being self-employed (+8) have considerably higher BMIs than other patients. The BMI of patients with hypertension (+2.5) and married patients (+2.1) is also higher. With increasing glucose levels in the blood, patients also have a higher BMI, but the coefficient is harder to interpret for non-medical staff. Patients whose smoking status is unknown have lower BMIs. All of these predictors are strongly significant at the 95% confidence interval. The age of patients is still strongly signficant, although less than other factors and interestingly, older patients have slightly lower BMIs (-0.01 per year of age).\
+
+###### **2.2.3 Comparison of predictive power of both linear models**
+
+Both models have virtually the same predictive power as their adjusted R-squared indicate that they explain slightly less than 24 percent of the variance in the BMI of patients from the mean.\
+
+###### **2.2.4 Out-of-sample performance of both models**
+
+Since the models were fitted using all available observations, we might have overfitted them and their performance on new, unseen data, might be considerably worse. To solve this problem, cross-validation was performed. The models were trained with the data of 80% of the patients that were randomly selected. These models were then used to predict whether patients had a stroke for the remaining 20% that were not used to fit the linear models. In order to obtain more robust results and avoid the possibility of one particular split being advantageous to one of the models, this was repeated 100 times and the average root-mean-square error (RMSE), mean absolute error (MAE), and R-squared of all splits calculated.\
+
+```{r Omit missing values and create emtpy lists for cross-validation, include=FALSE}
+df_clean <- na.omit(df)
+r.squared.simple <- c()
+r.squared.complex <- c()
+mae.simple <- c()
+mae.complex <- c()
+rmse.simple <- c()
+rmse.complex <- c()
+```
+
+```{r LMs Out-of-sample performance, echo=TRUE}
+set.seed(2)
+for(i in 1:10^2){
+  ## Split the dataset into train and test sets
+  is_train <- runif(nrow(df_clean)) < 0.8
+  train <- df_clean[is_train, ]
+  test <- df_clean[!is_train, ]
+  # Simple model
+  ## Fit the simple model with train data
+  lm.simple <- lm(formula(lm.bmi.simple), data = train)
+  ## Use the model to predict BMI values for the test data
+  predicted.simple <- predict(lm.simple, newdata = test)
+  ## Compute R Squared, MAE, and RMSE of the simple model
+  r.squared.simple[i] <- cor(predicted.simple, test$bmi)^2
+  mae.simple[i] <- MAE(test$bmi, predicted.simple)
+  rmse.simple[i] <- RMSE(predicted.simple, test$bmi)
+  
+  # Complex model
+  ## Fit the complex model with train data
+  lm.train <- lm(formula(lm.bmi), data = train)
+  ## Use the model to predict BMI values for the test data
+  predicted <- predict(lm.train, newdata = test)
+  ## Compute R Squared, MAE, and RMSE of the simple model
+  r.squared.complex[i] <- cor(predicted, test$bmi)^2
+  mae.complex[i] <- MAE(test$bmi, predicted)
+  rmse.complex[i] <- RMSE(predicted, test$bmi)
+  }
+```
+
+\pagebreak
+Then the difference of the mean RMSE, MAE, and R-Squared of both models was calculated.
+
+```{r}
+mean(rmse.simple) - mean(rmse.complex)
+mean(mae.simple) - mean(mae.complex)
+mean(r.squared.simple) - mean(r.squared.complex)
+```
+
+While the out-of sample performance of both models is very similar, we can see that the simple model consistently performs slightly better.\
+
+###### **2.2.5 Imputing missing BMI values with final linear model**
+
+For this reason, we used the simple model, which omits the gender and type of residence of patients, to predict the BMI of patients with missing values.
+
+```{r Impute missing BMI values with simple model, echo=TRUE, message=FALSE, warning=FALSE}
+# Replace missing values with predicted values of the best 10-fold cross validated model
+df <- df %>% 
+  mutate(pred = predict(lm.bmi.simple, .)) %>%
+  mutate(bmi = ifelse(is.na(bmi), pred, bmi))
+df <-df[1:(length(df)-1)]
+```
+
+#### **3. Data Visualisation**
+
+##### **3.1 Overview of Patients' Gender, Age, Glucose Levels, and BMI**
+
+\
+To gain a better overview of the patients, we first plotted the distribution of their gender, age, average glucose levels in the blood, and BMI.
+
+```{r Overview of Patients, echo=FALSE, fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+## Creating graphs
+
+# Gender
+count_gender <- ggplot(df, aes(x=gender)) + geom_bar() + labs(x ="Gender of Patients", y = "Number of Patients")
+# Age
+count_age <- ggplot(df, aes(age)) + geom_histogram() + labs(x ="Age", y = "Number of Patients")
+# Avg. Glucose levels in blood
+count_glucose <- ggplot(df, aes(avg_glucose_level)) + geom_histogram() + labs(x ="Avg. Glucose Level in Blood", y = "Number of Patients")
+# BMI
+count_bmi<- ggplot(df, aes(bmi)) + geom_histogram() + labs(x ="BMI", y = "Number of Patients")
+
+# Plot all together
+grid.arrange(count_gender, count_age, count_glucose, count_bmi, ncol=4)
+```
+
+The dataset is slightly imbalanced in terms of gender: 58.6% of patients are female and 41.4% male. The age of patients is relatively evenly distributed (mean: 43 years). There are two main groups of patients with regards to the average glucose level in their blood: the majority is around 70 and the second group around 220 (this is also called a bimodial distribution). The BMI of patients is right skewed and has a long tail, which means that while the mean BMI of patients is around 28, there are patients with a BMI of up to 97.6.\
+
+##### **3.2 Overview of Patients with a Stroke**
+
+\
+Next, the response variable (stroke) was plotted.
+
+```{r Overview of Patients with a Stroke, echo=FALSE, fig.height=2, fig.width=3}
+ggplot(df, aes(stroke)) + scale_x_discrete(labels = c('No','Yes')) + geom_bar(fill=c("darkgreen", "darkred")) + labs(x ="Patient Had a Stroke", y = "Number of Patients")
+```
+
+The dataset is very imbalanced: only 249 patients (4.87%) have had a stroke, with a slightly higher share of men (5.1%) than women (4.7%) being affected. As will be later discussed, this has an impact on creating training and testing splits of the dataset as there might only be very few cases in each of the sets, which dramatically decreases the reliability of model performance assessments.\
+\
+
+
+##### **3.3 Age, BMI, and Glucose Levels of Stroke Patients**
+
+\
+In a next step, the differences in age, BMI, and average glucose level in the blood of between stroke and non-stroke patients were plotted.
+
+```{r Stroke Patients Characteristics, echo=FALSE, fig.height=4, fig.width=12}
+## Creating graphs for age, BMI, and average glucose levels in the blood of stroke patients
+
+# Age
+boxplot_age <- ggplot(df, aes(y = age, x = stroke)) + geom_boxplot(fill=c("darkgreen", "darkred")) + scale_x_discrete(labels = c('No','Yes')) + labs(x ="Patient Had Stroke", y = "Age")
+# BMI
+boxplot_bmi <- ggplot(df, aes(y=bmi, x=stroke)) + scale_x_discrete(labels = c('No','Yes')) + geom_boxplot(fill=c("darkgreen", "darkred")) + labs(x ="Patient Had Stroke", y = "BMI")
+# Average glucose levels
+boxplot_glucose <- ggplot(df, aes(y=avg_glucose_level, x=stroke)) + scale_x_discrete(labels = c('No','Yes')) + geom_boxplot(fill=c("darkgreen", "darkred")) + labs(x ="Patient Had Stroke", y = "Average Glucose Level in Blood")
+
+# Plot all together
+grid.arrange(boxplot_age, boxplot_bmi, boxplot_glucose, ncol=3)
+```
+
+With over 71 years, the median age of patients with a stroke is considerably higher than that of healthy patients (43 years). Moreover, while the middle half of the healthy patients are aged between 24 and 59, the middle half of patients who suffered a stroke are much older (between 59 and 78). This indicates that the risk of a stroke increases with higher age.
+
+There is no discernible difference between the BMI of patients with and without a stroke as the median BMI of both is around 29.
+
+With 91.5, the average glucose level in the blood of patients who have not had a stroke is lower than that of patients with a stroke (105.22). The range of glucose levels of the middle half of patients without a stroke is also considerably lower (77 to 113) than that of patients with a stroke (80 to 197).
+
+##### **3.4 Age of Patients with Hypertension and Heart Disease**
+
+\
+Since age seems to play an important role, the differences in age between patients with hypertension and heart disease were also plotted.
+
+```{r Age of Patients with Hypertension and Heart Disease, echo=FALSE, fig.height=2, fig.width=8, message=FALSE, warning=FALSE}
+##Create Graphs
+
+# Hypertension
+plot_age_hypertension <- ggplot(df, mapping = aes(y = age, x = hypertension)) + geom_boxplot(fill=c("darkgreen", "darkred")) + scale_x_discrete(labels = c('No','Yes')) + labs(x ="Patient Has Hypertension", y = "Age")
+# Heart Disease
+plot_age_heart_disease <- ggplot(df, mapping = aes(y = age, x = heart_disease)) + geom_boxplot(fill=c("darkgreen", "darkred")) + scale_x_discrete(labels = c('No','Yes')) + labs(x ="Patient Has a Heart Disease", y = "Age")
+
+# Plot graphs together
+grid.arrange(plot_age_hypertension, plot_age_heart_disease, ncol=2)
+```
+
+Overall, 498 patients (9.7%) suffer from hypertension and 276 (5.4%) have a heart disease. Both of these conditions are clearly more prevalent in older patients: the mean age of patients with hypertension is 62 years, whereas that of healthy patients is 41, and the mean age of patients with a heart disease is 68 years, whereas that of healthy patients is 42.\
+
+##### **3.5 Hypertension, Heart Disease, Marriage Status, Work Type, and Smoking Status of Patients**
+
+\
+In a last step, differences between stroke and non-stroke patients in terms of hypertension, heart disease, marriage status, work type, and smoking status were plotted.
+
+```{r Hypertension, echo=FALSE, fig.height=3, fig.width=10, message=FALSE, warning=FALSE}
+ggplot(df, aes(x= hypertension,  group=stroke)) + geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + geom_text(aes( label = scales::percent(..prop..), y= ..prop.. ), stat= "count") + labs(y = "Percentage", fill="Hypertension") + facet_grid(~stroke) + scale_y_continuous(labels = scales::percent) + scale_fill_discrete(breaks=c("1","2"), labels= c("No","Yes")) + ggtitle("Hypertension of Patients (0: no stroke, 1: stroke)") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(size=14))
+```
+
+Since older patients have a higher risk of both, a stroke and hypertension, it is not surprising to see that 27% of patients with a stroke also suffer from hypertension, whereas only 9 % of patients without a stroke do.\
+
+```{r Heart Disease, echo=FALSE, fig.height=3, fig.width=10, message=FALSE, warning=FALSE}
+ggplot(df, aes(x= heart_disease,  group=stroke)) + geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + geom_text(aes( label = scales::percent(..prop..), y= ..prop.. ), stat= "count") + labs(y = "Percentage", fill="Heart Disease") + facet_grid(~stroke) + scale_y_continuous(labels = scales::percent) + scale_fill_discrete(breaks=c("1","2"), labels= c("No","Yes")) + ggtitle("Heart Disease of Patients (0: no stroke, 1: stroke)") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(size=14))
+```
+
+As the risk for heart disease also increases with higher age, it is not surprising to see that the share of stroke patients suffering from this condition is also higher (19%) than that of patients who have never had a stroke (5%).\
+
+```{r Marriage Status, echo=FALSE, fig.height=3, fig.width=10, message=FALSE, warning=FALSE}
+ggplot(df, aes(x= ever_married,  group=stroke)) + geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + geom_text(aes( label = scales::percent(..prop..), y= ..prop.. ), stat= "count") + labs(y = "Percentage", fill="Ever Married") + facet_grid(~stroke) + scale_y_continuous(labels = scales::percent) + scale_fill_discrete(breaks=c("1","2"), labels= c("No","Yes")) + ggtitle("Married Patients (0: no stroke, 1: stroke)") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(size=14)) 
+```
+
+Since the older patients get, the more likely they are to be or have been married, it also makes sense that more patients who have had a stroke (88%) have been married than those who didn't have a stroke (64% ).\
+
+```{r Work Type, echo=FALSE, fig.height=3, fig.width=10, message=FALSE, warning=FALSE}
+ggplot(df, aes(x= work_type,  group=stroke)) + geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + geom_text(aes( label = scales::percent(..prop..), y= ..prop.. ), stat= "count") + labs(y = "Percentage", fill="Work Type") + facet_grid(~stroke) + scale_y_continuous(labels = scales::percent) + scale_fill_discrete(breaks=c("1","2","3","4","5"), labels= c("Children","Government Job","Never worked","Private","Self-employed")) + ggtitle("Work Type of Patients (0: no stroke, 1: stroke)") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(size=14))
+```
+
+In line with this, we also see that there are barely any children among stroke patients. However, the risk of a stroke is considerably higher among self-employed patients (25.5%) than among the rest (15.5%), which might be related to self-employed people having more responsibility and stress.\
+
+```{r Smoking Status, echo=FALSE, fig.height=3, fig.width=10, message=FALSE, warning=FALSE}
+ggplot(df, aes(x= smoking_status,  group=stroke)) + geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + geom_text(aes( label = scales::percent(..prop..), y= ..prop.. ), stat= "count") + labs(y = "Percentage", fill="Smoking status") + facet_grid(~stroke) + scale_y_continuous(labels = scales::percent) + scale_fill_discrete(breaks=c("1","2","3","4"), labels= c("Formerly smoked","Never smoked", "Smokes", "Unknown")) + ggtitle("Smoking Status of Patients (0: no stroke, 1: stroke)") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), plot.title = element_text(size=14))
+```
+
+Lastly, it is worth noting that over 45% of stroke patients are current smokers or have smoked in the past, whereas this is true for only 32% of patients who have not had a stroke, so there could be a connection between smoking and stroke risk as well.
+
+\pagebreak
+
+#### **4. Stroke Predictions**
+
+\
+Before discussing individual prediction models and their performance, it is important to clarify some key terms in this context.
+
+***Sensitivity***, ***recall***, or ***true positive rate*** refers to the proportion of positives that are correctly identified (i.e. the proportion of patients who have had a stroke who are correctly identified as such).
+
+***Specificity*** or ***true negative rate***, on the other hand, refers to the proportion of negatives that are correctly identified (i.e. the proportion of patients who are correctly identified as not having suffered a stroke).
+
+***False negatives*** are patients who have suffered a stroke that are classified as healthy. This is very problematic as such patients would not receive the treatment and advice they might need to reduce their risk and improve their health.
+
+Lastly, ***false positives*** are patients who are healthy, but wrongly classified as being at risk of a stroke. While this is less problematic, having a large number of false positives would mean that a large number of patients have to be treated by a physician, which might not be possible due to resource limitations.
+
+A perfect classification algorithm would correctly detect all patients at risk of a stroke and not wrongly classify any of the healthy ones as at risk.\
+
+##### **4.1 Generalised Linear Models (GLM) to Predict Patients' Stroke**\
+
+###### **4.1.1 Fitting a Complex and Simple GLM**
+
+A logistic model is well-suited to predict binary variables such as whether a patient has had a stroke or not. We created and tested two models: one taking all predictors into consideration and one omitting predictors based on stepwise model selection. Due to the limited scope of this analysis, only the coefficients of the simple model will be discussed.
+
+```{r GLMs, echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+glm.stroke <- glm(stroke ~., family = "binomial", data = df)
+glm.stroke.simple <- stepAIC(glm.stroke, direction="both", trace = FALSE)
+summary(glm.stroke.simple)
+```
+
+\
+The simple model retains only four predictors: at the 95% confidence interval, the age, average glucose levels in the blood, and hypertension are the only predictors that have a significant impact on whether a patient has a stroke. Heart disease has a significant impact at the 90% confidence level. The coefficients tell us that with each year that patients get older, their risk of a stroke increases by 6.9%. Moreover, their risk is 38% higher if they suffer from hypertension and 33% higher if they have a heart disease. For each additional millimole of glucose per litre of blood of a patient, the risk increases by .4%, which is pretty difficult to interpret for people outside of the medical field.\
+
+###### **4.1.2 Determining Optimal Cutoff For When to Classify a Patient as a Stroke Patient**
+
+In order to evaluate the model, it is important to choose at which likelihood of being a stroke patient, patients are classified as such. This is done by finding a value that maximises both sensitivity and specificity of the prediction model. It is also possible to penalise for example false negatives as this could result in people losing their lives, but since this requires more detailed knowledge of the topic area, no weighting was performed.\
+
+```{r Determine Cutoff of both GLMs}
+## Complex GLM
+# Predict Probabilities of a Stroke
+glm.stroke.probs <- predict(glm.stroke, type = "response")
+# Create prediction and performance objects for cutoff determination
+glm.stroke.prediction <- prediction(glm.stroke.probs, df$stroke)
+glm.stroke.performance <- performance(glm.stroke.prediction, "tpr", "fpr")
+# Determine optimal cutoff for probability of stroke
+glm.stroke.opt.cut = function(performance, prediction){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], cutoff = p[[ind]])},
+        performance@x.values, performance@y.values, prediction@cutoffs)}
+glm.stroke.cutoff <- glm.stroke.opt.cut(glm.stroke.performance, glm.stroke.prediction)
+
+### Repeat the same procedure for the simple GLM
+glm.stroke.simple.probs <- predict(glm.stroke.simple, type = "response")
+glm.stroke.simple.prediction <- prediction(glm.stroke.simple.probs, df$stroke)
+glm.stroke.simple.performance <- performance(glm.stroke.simple.prediction, "tpr", "fpr")
+glm.stroke.simple.opt.cut = function(performance, prediction){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], cutoff = p[[ind]])},
+        .performance@x.values, performance@y.values, prediction@cutoffs)}
+glm.stroke.simple.cutoff <- glm.stroke.opt.cut(glm.stroke.simple.performance,
+                                               glm.stroke.simple.prediction)
+glm.stroke.cutoff[3,]
+glm.stroke.simple.cutoff[3,]
+```
+\
+The optimal cutoff for detecting as many stroke patients as possible while wrongly classifying as few healthy patients as "at-risk" as possible is at 5.3% for the complex model and 6% for the simple one. Using those cutoffs, we can predict patients as at risk or not and create a confusion matrix for both models.\
+
+```{r }
+### Confusion Matrix for predictions using above cutoffs
+## Complex Model
+glm.stroke.pred <- ifelse(glm.stroke.probs > 0.05300043, "1", "0")
+glm.stroke.table <- table(glm.stroke.pred, df$stroke, dnn = c("Prediction", "Reference"))
+cm.glm.stroke <- caret::confusionMatrix(glm.stroke.table, mode = "everything", positive = "1")
+## Simple Model
+glm.stroke.simple.pred <- ifelse(glm.stroke.simple.probs > 0.06022315, "1", "0")
+table.simple <- table(glm.stroke.simple.pred, df$stroke, dnn = c("Prediction", "Reference"))
+cm.glm.stroke.simple <- caret::confusionMatrix(table.simple, mode = "everything", positive = "1")
+```
+
+###### **4.1.3 In-Sample Performance of both GLMs**
+
+The in-sample performance of both models was compared by looking at the respective confusion matrices.
+
+```{r}
+### Confusion Matrix of the complex GLM
+cm.glm.stroke$table
+```
+
+```{r}
+### Performance of the complex GLM
+cm.glm.stroke$byClass
+```
+\
+The complex model correctly identifies 199 patients with a stroke, but misses 50 stroke patients (sensitivity: 80%). It also correctly identifies 3647 healthy patients, but wrongly classifies 1213 healthy patients as having a stroke (specificity: 75%). This means that only 14% of patients classified as having had a stroke have actually had one. Therefore, using this model to predict strokes would result in too many patients needing to be screened by a doctor despite being healthy.\
+
+```{r}
+### Confusion Matrix of the simple GLM
+cm.glm.stroke.simple$table
+```
+
+```{r}
+### Performance of the simple GLM
+cm.glm.stroke.simple$byClass
+```
+\
+The simple model correctly classifies 190 patients (9 fewer than the complex model), and misses 59 (sensitivity: 76%). It correctly identifies 3752 healthy patients, and wrongly classifies 1108 (specificity: 77%). While this model has the same drawback as the one above, it has a slightly worse ability to identify stroke patients.\
+
+###### **4.1.4 Out-of-Sample Performance of both GLMs Using Imbalanced and Oversampled data**
+
+For the same reasons mentioned in 2.2.4, cross-validation was again performed in the same way, the only difference being that the performance of both models was assessed by comparing the confusion matrices containing the predictions and observations for all 100 splits. Moreover, as was previously mentioned, the dataset is highly imbalanced in terms of patients who have suffered a stroke. This means that there could be very few observations in the training split, which would deteriorate the performance of the model. For this reason, the ROSE package was used to oversample patients who have had a stroke. Due to limited space, we will not get into more detail about this package, but it essentially generates new synthetic data (in our case patients with a stroke).
+
+We then compared the performance of models trained on the original, imbalanced data, to those trained on oversampled data. Since the procedure is almost identical for both approaches, and due to the limited space available for this report, only the performance of the models trained on imbalanced data will be shown. Afterwards, the code for the procedure using oversampled data, as well as the performance of the resulting models will be shown and discussed.
+
+```{r GLMs out-of-Sample Performance Imbalanced, message=FALSE, warning=FALSE, include=FALSE}
+df_glm <- df
+df_glm$stroke <- as.numeric(df_glm$stroke)
+df_glm$stroke <- ifelse(df_glm$stroke == 2, 1, 0)
+dfinal.simple <- df_glm[-c(1:nrow(df_glm)),]
+dfinal.complex <- df_glm[-c(1:nrow(df_glm)),]
+# 100 Train Test Splits
+for(i in 1:10^2){
+  ## Split the dataset
+  is_train <- runif(nrow(df_glm)) < 0.8
+  train <- df_glm[is_train, ]
+  test <- df_glm[!is_train, ]
+  ## Simple model
+  ## Fit the simple model with train data
+  glm.simple.train <- lm(formula = formula(glm.stroke.simple), data = train)
+  ## Use the model to predict stroke for the test data
+  test$stroke.probs.simple <- predict(glm.simple.train, newdata = test)
+    test$stroke.pred.simple <- ifelse(test$stroke.probs.simple > 0.06022315, 1, 0)
+  dfinal.simple <- rbind(dfinal.simple, test)
+  #
+  ## Complex model
+  ## Fit the complex model with train data
+  glm.train <- lm(formula = formula(glm.stroke), data = train)
+  ## Use the model to predict stroke for the test data
+  test$stroke.probs <- predict(glm.train, newdata = test)
+  test$stroke.pred <- ifelse(test$stroke.probs > 0.05300043, 1, 0)
+  dfinal.complex <- rbind(dfinal.complex, test)}
+
+# Create Confusion Matrices
+# Simple Model
+cm.glm.simple.imbalanced <- caret::confusionMatrix(as.factor(dfinal.simple$stroke.pred.simple), as.factor(dfinal.simple$stroke), positive = "1")
+# Complex Model
+cm.glm.imbalanced <- caret::confusionMatrix(as.factor(dfinal.complex$stroke.pred), as.factor(dfinal.complex$stroke), positive = "1")
+```
+
+
+```{r Data Preparation GLMs out-of-Sample Performance Oversampled, message=FALSE, warning=FALSE, include=FALSE}
+# Change factor to numeric and reencode values
+df_glm <- df
+df_glm$stroke <- as.numeric(df_glm$stroke)
+df_glm$stroke <- ifelse(df_glm$stroke == 2, 1, 0)
+# Create dataframes to add up correlation matrices of splits
+dfinal.simple <- df_glm[-c(1:nrow(df_glm)),]
+dfinal.complex <- df_glm[-c(1:nrow(df_glm)),]
+```
+
+```{r GLMs out-of-Sample Performance Oversampled, echo=TRUE, message=FALSE, warning=FALSE}
+set.seed(2)
+for(i in 1:10^2){
+  ## Split the dataset
+  is_train <- runif(nrow(df_glm)) < 0.8
+  train <- df_glm[is_train, ]
+  test <- df_glm[!is_train, ]
+  # Balancing imbalanced dataset with ROSE
+  stroke.train.rose <- ROSE(stroke ~., data = train, p=0.5, seed=123)$data
+    ## Simple mode
+  ## Fit the simple model with train data
+  glm.simple.train <- lm(formula = formula(glm.stroke.simple), data = stroke.train.rose)
+  ## Use the model to predict stroke for the test data
+  test$stroke.obs.simple <- predict(glm.simple.train, newdata = test)
+  test$stroke.pred.simple <- ifelse(test$stroke.obs.simple > 0.06022315, 1, 0)
+  dfinal.simple <- rbind(dfinal.simple, test)
+
+  ## Complex model
+  ## Fit the complex model with train data
+  glm.complex.train <- lm(formula = formula(glm.stroke), data = stroke.train.rose)
+  ## Use the model to predict stroke for the test data
+  test$stroke.obs <- predict(glm.complex.train, newdata = test)
+  test$stroke.pred <- ifelse(test$stroke.obs > 0.05300342, 1, 0)
+  dfinal.complex <- rbind(dfinal.complex, test)
+  }
+# Confusion matrix for complex model
+cm.glm.rose <- caret::confusionMatrix(as.factor(dfinal.complex$stroke.pred),
+                                      as.factor(dfinal.complex$stroke), positive = "1")
+# Confusion matrix for simple model
+cm.glm.simple.rose <- caret::confusionMatrix(as.factor(dfinal.simple$stroke.pred.simple),
+                                             as.factor(dfinal.simple$stroke), positive = "1")
+```
+
+```{r Out-of-Sample Performance Complex GLM Imbalanced}
+# Confusion Matrix of complex GLM with imbalanced data
+cm.glm.imbalanced$byClass
+```
+\
+
+```{r Out-of-Sample Performance Simple GLM Imbalanced}
+# Confusion Matrix of simple GLM with imbalanced data
+cm.glm.simple.imbalanced$byClass
+```
+\
+The performance of the complex and simple models trained on imbalanced data is fairly similar: the complex one correctly detects 89% of stroke patients and 62% of healthy patients, but only 10% of patients classified as stroke patients were indeed affected. The simple model correctly detects 87% of stroke patients and 64% of healthy patients, but only 11 % of patients classified as having a stroke had one.
+
+```{r Out-of-Sample Performance Complex GLM Oversampled}
+# Confusion matrix and performance of complex GLM with oversampled data
+cm.glm.rose$table
+cm.glm.rose$byClass
+```
+
+```{r Out-of-Sample Performance Simple GLM Oversampled}
+# Confusion matrix and performance of simple GLM with oversampled data
+cm.glm.simple.rose$table
+cm.glm.simple.rose$byClass
+```
+\
+The two models trained on oversampled data performed almost the same out of the 100 samples: both are able to detect more than 98% of stroke patients. While this performance is very impressive, the models only correctly classify around a fifth of healthy patients as such. Only 6% of patients for whom a stroke was predicted have in fact actually had one.\
+
+###### **4.1.5 Conclusion GLM**
+
+While oversampling helped increase the proportion of correctly identified stroke patients by around 10%, the models trained on the original, imbalanced data, had a considerably higher specificity (44.6% higher for the simple model and 40% higher for the complex one) and a much lower false positive rate. However, none of the GLM models are promising as their false positive rate would result in hospitals or doctors having to screen an enormous amount of patients.\
+
+#### **4.2 Predicting Number of Strokes in Age Groups Using GLM**
+\
+In the following, a poisson GLM model is used to predict the number of strokes in different age groups. Since the original data set does not contain any count data, age groups were manually formed and the number of strokes for each age group counted and then predicted.
+
+##### **4.2.1 Forming age groups**
+\
+This chapter is used to define the age groups and count the number of strokes in each group. Then, the results are plotted in a graph, showing the proportion of patients in each age group that have had a stroke.
+
+```{r Forming the different age groups, message=FALSE, warning=FALSE, paged.print=FALSE}
+# defining a new dataframe with a new column "AgeGroup"
+df_new <- mutate(df, AgeGroup = case_when(age >= 80~ '80+',
+                                          age >= 70 ~ '70 - 79',
+                                          age >= 60 ~ "60 - 69",
+                                          age >= 50 ~ "50 - 59",
+                                          age >= 40 ~ "40 - 49",
+                                          age >= 30 ~ "30 - 39",
+                                          age >= 20 ~ "20 - 29",
+                                          age >= 10 ~ "10 - 19",
+                                          TRUE ~ '0 - 9'))
+df_new$stroke<- as.numeric(levels(df_new$stroke))[df_new$stroke]
+df_aggregated <- aggregate(stroke ~ AgeGroup, df_new, sum)
+df_aggregatedtemp <- aggregate(cbind(count = stroke) ~ AgeGroup,
+                               data = df_new,
+                               FUN = function(x){NROW(x)})
+df_aggregated$TotalAgeGroup <- df_aggregatedtemp$count
+df_aggregated$PercentageStroke <- (df_aggregated$stroke/df_aggregated$TotalAgeGroup)*100
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE,fig.height=3, fig.width=5}
+# plotting the results
+ggplot(mapping = aes(y = df_aggregated$PercentageStroke,
+x = df_aggregated$AgeGroup)) +
+geom_bar(stat="identity", fill=c("steelblue","springgreen","darkcyan","lightcoral","palevioletred4","lightgreen","steelblue3","lightgoldenrod","palegreen4")) +
+ylab("Proportion of Patients with Stroke in %") +
+xlab("Age Group")
+```
+
+The stroke risk increases almost exponentially with increasing age. This makes sense from a medical perspective and is in line with our findings from the visual exploration of the dataset that showed that the risk of a stroke is higher for older people than for younger.
+
+##### **4.2.2 Predicting the number of strokes in the different age groups**
+\
+Below, a prediction is made of how many strokes will occur in the predefined age groups. Then, the two graphs are plotted, the first showing the actual number of strokes per age group and the second showing the prediction.
+
+```{r Predicting the number of strokes in the different AgeGroups, message=FALSE, warning=FALSE, paged.print=FALSE}
+# prediction
+glm.df_aggregated <- glm(stroke ~ AgeGroup, family = "poisson", data = df_aggregated)
+set.seed(2)
+sim.data.stroke.Poisson <- simulate(glm.df_aggregated)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE,fig.height=3, fig.width=5}
+# plotting the results
+ggplot(mapping = aes(y = df_aggregated$stroke,
+x = df_aggregated$AgeGroup)) +
+geom_bar(stat="identity", fill=c("steelblue","springgreen","darkcyan","lightcoral","palevioletred4","lightgreen","steelblue3","lightgoldenrod","palegreen4")) +
+ylab("no. of people with stroke") +
+xlab("Age Group")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE,fig.height=3, fig.width=5}
+# plotting the results
+ggplot(mapping = aes(y = sim.data.stroke.Poisson$sim_1,
+x = df_aggregated$AgeGroup)) +
+geom_bar(stat="identity", fill=c("steelblue","springgreen","darkcyan","lightcoral","palevioletred4","lightgreen","steelblue3","lightgoldenrod","palegreen4")) +
+ylab("simulated no. of people with stroke") +
+xlab("Age Group")
+```
+
+The model performs quite well, as the distribution of strokes looks nearly equal in both plots. The only remarkable difference is that the actual risk of a stroke is higher in the age group 50-59 than in the age group 60-69, which is not the case in the simulated data.
+
+\pagebreak
+
+#### **4.3 Generalised Additive Models (GAMs) to Predict Stroke**
+\
+```{r Generalised Additive Models to Predict Stroke, message=FALSE, warning=FALSE, include=FALSE}
+#Variable 'Stroke' cannot be a factor for the GAM
+df[,"stroke"] <- as.numeric(df[,"stroke"])
+df$stroke <- ifelse(df$stroke == 2, 1, 0)
+```
+
+In this chapter, the technique of a GAM will be applied to predict strokes.
+At first, the GAM with the original dataset will be fitted.
+It is important to set the option 'family' to binomial since the response variable is measured in 1 (stroke) and 0 (no stroke).
+
+##### **4.3.1 GAM | No Sampling**
+
+```{r GAM Model | No Sampling, echo=FALSE, message=FALSE, warning=FALSE}
+#GAM Model | No Sampling
+set.seed(1)
+gam_model <- gam(stroke ~ s(avg_glucose_level) + s(bmi) + gender + hypertension + heart_disease + ever_married + work_type + Residence_type + smoking_status + age, data = df, family = "binomial")
+summary(gam_model)
+```
+
+According to the model, the only significant smooth term is avg_glucose_level with an estimated degree of freedom (edf) of 1.001, so it is nearly linear.
+The smooth term BMI does not have a significant effect and is therefore not used in the GAM.
+
+Also, only the intercept, Hypertension(1) and age have a p-Value below the significance level.
+
+The significance of the remaining variables is not below the 5 % significance level and they are therefore not used in the GAM.
+
+```{r QQPLOT gam_model, echo=FALSE, fig.height=3.5, fig.width=5, message=FALSE, warning=FALSE}
+qq.gam(gam_model, rl.col=3,  main="QQ-Plot | unsampled dataset")
+```
+
+It is clearly visible that the GAM with imbalanced data does not follow the QQ-Line.
+This means, that the assumptions for the residuals made by the model do not meet the data. 
+
+However, the original dataset was used for this model, which is a problem because it is an unbalanced dataset. This means that our result could be misleading.
+
+Therefore, the new GAM model is fitted using oversampled data.
+
+A comparison of QQ-Plots will show the effect of oversampling on the residuals.
+
+##### **4.3.2 GAM | Oversampling**
+\
+In order to apply the GAM technique, the dataset will be oversampled.
+
+```{r ROSE oversampling, message=FALSE, warning=FALSE, include=FALSE}
+#Oversampling
+set.seed(1)
+df_oversampling <- ROSE(stroke ~., data = df, seed=3, p = 0.5)$data
+```
+
+Now, the occurrence of strokes is nearly balanced and the GAM can be fitted.
+
+```{r GAM with ROSE oversampling, echo=FALSE, message=FALSE, warning=FALSE}
+#GAM Model
+gam_model_oversampling <- gam(stroke ~ s(avg_glucose_level) + s(bmi) + gender + hypertension + heart_disease + ever_married + work_type + Residence_type + smoking_status + age, data = df_oversampling, family = "binomial")
+summary(gam_model_oversampling)
+```
+
+With the oversampled data, the GAM changed drastically.
+
+The smooth term avg_glucose_level becomes more complex with an edf of 7.84 and the other smooth term BMI is now significant with an edf of 7.424.
+
+In addition, the intercept, the variables hypertension(1), heart_disease(1), work_type(Govt_job, Self-employed, Private), Residence_type(Urban), smoking_status(never smoked) and age are significant.
+
+The residuals (avg_glucose_level and bmi) will not be plotted here due to the limit of 30 pages.
+
+To evaluate if the assumptions made by this GAM for the residuals is now better than the first one, a second QQ-Plot will be produced.
+
+```{r QQPLOT oversampled GAM, echo=FALSE, fig.height=3.5, fig.width=5, message=FALSE, warning=FALSE}
+qq.gam(gam_model_oversampling, rl.col=3,  main="QQ-Plot | oversampled dataset")
+```
+
+The assumptions made by the GAM for the residuals are now better than in the first model.
+But slight deviations occur in the edge area, which means that this model is still not perfect.
+However, the performance increased compared to the first GAM.
+
+##### **4.3.3 Confusion Matrix**
+\
+In order to know how good the GAM is, the Sensitivity and the Specificity will be calculated.
+
+The first model will not be taken into account here, since the QQ-plot is very bad.
+Therefore only the second GAM trained on oversampled data will be examined.
+
+```{r Gam Oversampled}
+set.seed(1)
+for(i in 1:30){
+  #Oversampled
+  indices_gam_over <- createDataPartition(df$stroke, p=.7, list = F)
+  train <- df %>%
+    slice(indices_gam_over)
+  test_in_over <- df %>%
+    slice(-indices_gam_over) %>%
+    dplyr::select(-stroke)
+  test_truth_over <- df%>%
+    slice(-indices_gam_over) %>%
+    pull(stroke)
+  train_over <- ROSE(stroke ~., data = train, p=0.5)$data
+  gam_model_oversampling <- gam(stroke ~ s(avg_glucose_level) + s(bmi) 
+                      + gender + hypertension + heart_disease + ever_married 
+                      + work_type + Residence_type + smoking_status + age, 
+                      data = train_over, family = "binomial")
+  test_pred_over <- predict(gam_model_oversampling, test_in_over)
+  pred <- ifelse(test_pred_over > 0.5, "1", "0")
+  test_truth_over <- ifelse(test_truth_over > 0.5, "1", "0")
+  conf_matrix <- confusionMatrix(factor(pred), factor(test_truth_over), positive = "1")
+  ifelse(i==1, oversampled <- conf_matrix$byClass, oversampled <- oversampled 
+         + conf_matrix$byClass)}
+oversampled/i
+```
+
+The sensitivity (true-positive-rate) is \~61% and the specificity (true-negative-rate) is \~84%, meaning that the GAM identifies 61% of the patients correctly as having had a stroke, whereas 84% of the healthy people are correctly identified as healthy patients. In addition, the positive predicted values are only \~16%, which is the proportion that the GAM classifies as having had a stroke, but is actually healthy.
+
+Furthermore this model was fitted on oversampled data, which was a helpful solution for the problem of imbalanced data, but oversampling also comes with a loss of information and one row had to be removed from the dataset.
+
+To put it in a nutshell, due to its low sensitivity, the GAM is not very suitable for this dataset.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#'Stroke' back to factor for other models
+df$stroke<- as.factor(df$stroke)
+```
+
+
+#### **4.4 Support Vector Machines (SVM) to Predict Strokes**
+\
+This chapter deals with the implementation of a support vector machine (SVM) model to predict strokes based on the predictors in the dataset.
+
+##### **4.4.1 SVM for unbalanced data**
+\
+The first step is to create a model based on unbalanced data. For this purpose, the data was split into a train, test-in and test-truth set.
+
+```{r SVM, message=FALSE, warning=FALSE, include=FALSE}
+set.seed(2)
+## Prepare the Data for Training
+indices <- createDataPartition(df$stroke, p=.7, list = F)
+### Create some easy Variables to access Data
+train <- df %>%
+  slice(indices)
+test_in <- df %>%
+  slice(-indices) %>%
+  dplyr::select(-stroke)
+test_truth <- df%>%
+  slice(-indices) %>%
+  pull(stroke)
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+stroke_svm <- svm(stroke ~ ., train, kernel = "radial", scale = TRUE, cost = 100)
+test_pred <- predict(stroke_svm, test_in)
+conf_matrix <- confusionMatrix(test_pred, test_truth, positive = "1")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+conf_matrix$table
+conf_matrix$byClass
+```
+
+The model looks pretty bad as it only classifies 2.7% of the effectively ill persons as being ill. Moreover, only one third of patients who classified as ill by the model are actually ill. However, it should be noted that this result also depends on the test and train split, so cross-validation is again necessary.
+
+##### **4.4.2 Balanced data, oversampling**
+\
+Before the cross-validation takes place, the SVM models are trained with balanced data. The following section does the balancing using the ROSE function, which was applied to the training set so that the test of the model could be performed with the original data. For this purpose, the data was also split into a train, test-in and test-truth set.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+### Make the sampling
+set.seed(2)
+indices.over <- createDataPartition(df$stroke, p=.7, list = F)
+#Create a balanced dataset
+train <- df %>%
+  slice(indices.over)
+test_in <- df %>%
+  slice(-indices.over) %>%
+  dplyr::select(-stroke)
+test_truth <- df %>%
+  slice(-indices.over) %>%
+  pull(stroke)
+```
+
+```{r message=FALSE, warning=FALSE}
+train.over <- ROSE(stroke ~., data = train, seed=3, p = 0.5)$data
+```
+
+```{r echo=TRUE}
+stroke.over_svm <- svm(stroke ~ ., train.over, kernel="radial", scale = TRUE)
+```
+
+It follows the confusion matrix for the SVM trained with balanced data.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+test_pred_over <- predict(stroke.over_svm, test_in)
+conf_matrix <- confusionMatrix(test_pred_over,test_truth, positive = "1")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+conf_matrix$table
+conf_matrix$byClass
+```
+
+The model seems to be more promising than the one trained with unbalanced data. It correctly detects almost 80% of stroke patients and 68% of healthy patients. However, only about 11% of patients classified as sick are actually sick.
+However, this cannot be said conclusively because cross-validation is necessary.
+
+##### **4.4.3 Balanced data, undersampling**
+\
+In addition to oversampling with the ROSE function, another model using undersampling was created as well. Here, patients who have not had a stroke were undersampled to balance the dataset. For this, the OVUN function was used. The data was split the same way as before.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# UNDERSAMPLING
+set.seed(2)
+indices.under <- createDataPartition(df$stroke, p=0.7, list = F)
+### Create some easy Variables to access Data
+train <- df %>%
+  slice(indices.under)
+test_in.under <- df %>%
+  slice(-indices.under) %>%
+  dplyr::select(-stroke)
+test_truth.under <- df %>%
+  slice(-indices.under) %>%
+  pull(stroke)
+```
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+train.under <- ovun.sample(stroke ~ ., data=train, method = "under")$data
+stroke.under_svm <- svm(stroke ~ ., train.under, kernel="radial", scale = TRUE)
+test_pred_under <- predict(stroke.under_svm, test_in.under)
+```
+
+It follows the confusion matrix for the SVM with balanced data, using OVUN-Function.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+conf_matrix <- confusionMatrix(test_pred_under,test_truth.under, positive = "1")
+conf_matrix$table
+conf_matrix$byClass
+```
+
+The sensitivity of 74% is slightly lower than for the model trained with oversampled data, but with 72% it has a higher specificity. The share of patients for whom a stroke was predicted correctly is approximately the same (11.96% here, 11.47% ROSE). This run with the OVUN function can therefore be described as slightly less accurate.
+
+##### **4.4.4 Balanced data, random undersampling**
+\
+The following section does the balancing by selecting the tuples randomly to balance the dataset.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+set.seed(2)
+indices.under2 <- createDataPartition(df$stroke, p=.7, list = F)
+### Create some easy Variables to access Data
+test_in.under2 <- df %>%
+  slice(-indices.under2) %>%
+  dplyr::select(-stroke)
+test_truth.under2 <- df %>%
+  slice(-indices.under2) %>%
+  pull(stroke)
+set.seed(3)
+stroke.under.pos <- sample_n(df[df["stroke"] == 0,], 249)
+stroke.under.neg <- df[df["stroke"] == 1,]
+train.under2 <- bind_rows(stroke.under.neg,stroke.under.pos)
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+stroke.under2_svm <- svm(stroke ~ ., train.under2, kernel="radial", scale = TRUE)
+test_pred_under2 <- predict(stroke.under2_svm, test_in.under2)
+conf_matrix <- confusionMatrix(test_pred_under2, test_truth.under2,positive = "1")
+```
+
+```{r echo=FALSE}
+conf_matrix$table
+conf_matrix$byClass
+```
+
+The sensitivity (78%) is between that of the model trained with oversampled and undersampled data. In the case of random splits, however, many of those without stroke are lost. The accuracy of the model could also be due to the split itself. This will now be determined by means of a cross-validation.
+
+\pagebreak
+
+##### **4.4.5 Cross-Validation SVM**
+\
+Cross-validation was performed for the four SVMs  (unbalanced, balanced (oversampling), balanced (undersampling), balanced (undersampling, random)).  
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+set.seed(3)
+for(i in 1:30){
+  #Unbalanced
+  indices.cw <- createDataPartition(df$stroke, p=.7, list = F)
+  train <- df %>%
+    slice(indices.cw)
+  test_in <- df %>%
+    slice(-indices.cw) %>%
+    dplyr::select(-stroke)
+  test_truth <- df%>%
+    slice(-indices.cw) %>%
+    pull(stroke)
+  stroke_svm <- svm(stroke ~ ., train, kernel = "radial", scale = TRUE, cost = 100)
+  test_pred <- predict(stroke_svm, test_in)
+  conf_matrix <- confusionMatrix(test_pred,test_truth, positive = "1")
+  ifelse(i==1, unbalanced <- conf_matrix$byClass, unbalanced <- unbalanced + conf_matrix$byClass)
+  # Oversampling  
+  train.over <- ROSE(stroke ~., data = train, p=0.5)$data
+  stroke.over_svm <- svm(stroke ~ ., train.over, kernel="radial", scale = TRUE)
+  test_pred_over <- predict(stroke.over_svm, test_in)
+  conf_matrix <- confusionMatrix(test_pred_over, test_truth, positive = "1")
+  ifelse(i==1, over <- conf_matrix$byClass, over <- over + conf_matrix$byClass)
+  # Undersampling 1
+  train.under <- ovun.sample(stroke ~ ., data=train, method = "under")$data
+  stroke.under_svm <- svm(stroke ~ ., train.under, kernel="radial", scale = TRUE)
+  test_pred_under <- predict(stroke.under_svm, test_in)
+  conf_matrix <- confusionMatrix( test_pred_under, test_truth, positive = "1")
+  ifelse(i==1, under <- conf_matrix$byClass, under <- under + conf_matrix$byClass)
+  # Undersampling 2
+  stroke.under.pos <- sample_n(df[df["stroke"] == 0,], 249)
+  stroke.under.neg <- df[df["stroke"] == 1,]
+  train.under2 <- bind_rows(stroke.under.neg,stroke.under.pos)
+  stroke.under2_svm <- svm(stroke ~ ., train.under2, kernel="radial", scale = TRUE)
+  test_pred_under2 <- predict(stroke.under2_svm, test_in)
+  conf_matrix <- confusionMatrix(test_pred_under2, test_truth, positive = "1")
+  ifelse(i==1, under2 <- conf_matrix$byClass, under2 <- under2 + conf_matrix$byClass)
+}
+unbalanced/i
+over/i
+under/i
+under2/i
+```
+
+In terms of sensitivity, the model with undersampling using random splitting performs best, detecting almost 85% of patients who have had a stroke. The model trained on undersampled data is in second place with a sensitivity of 82%, followed by the model trained with oversampled data with 80.1%. However, this model performs the worst with balanced data. This could be due to the fact that the ROSE function generates synthetic entries that no longer correspond to real patient data. For example, in a ROSE set, the age of the youngest patient is negative, which is not possible.
+
+All models perform rather poorly in the area of the "Pos Pred Value", i.e. how many of those classified as sick were actually sick. However, again the model trained with data undersampled using random splitting performed the best overall.
+
+#### **4.5. Neural Network to Predict Strokes**
+\
+This chapter is about building a Neural Network to predict strokes using the other variables in the dataset.
+
+##### **4.5.1 Neural Network for unbalanced data**
+\
+The first step was to create a model based on unbalanced data. The dataset was split into test and train data. Since this step is exactly the same as in the models before, the code is not shown in this document.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+# split the dataset into test and train data
+set.seed(2)
+indices.cw <- createDataPartition(df$stroke, p=.7, list = F)
+train <- df %>%
+  slice(indices.cw)
+test_in <- df %>%
+  slice(-indices.cw) %>%
+  dplyr::select(-stroke)
+test_truth <- df%>%
+  slice(-indices.cw) %>%
+  pull(stroke)
+```
+
+```{r Neural Network with unbalanced data, message=FALSE, warning=FALSE, paged.print=FALSE}
+# build the neural network
+#set.seed(2)
+stroke_net <- nnet(stroke ~ ., data = train, size=15, maxit=500, range=0.1, 
+                   decay=5e-4, trace=FALSE)
+# make predictions
+pred <- predict(stroke_net, test_in, type="class")
+# calculate accuracy and precision
+conf_matrix<-confusionMatrix(as.factor(pred),as.factor(test_truth), positive="1")
+conf_matrix$byClass
+conf_matrix$table
+```
+
+The model performs quite poorly with a sensitivity of only about 6.7%. This could be because the dataset is very unbalanced. Moreover, only 31.25% of the people assessed as sick are actually sick.
+
+##### **4.5.2 Balanced data, oversampling**
+\
+To check if the results are better with a balanced dataset, the ROSE function was applied to the training set to oversample stroke patients.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+# split the dataset into test and train data
+set.seed(2)
+indices.over <- createDataPartition(df$stroke, p=.7, list = F)
+train <- df %>%
+  slice(indices.over)
+test_in <- df %>%
+  slice(-indices.over) %>%
+  dplyr::select(-stroke)
+test_truth <- df%>%
+  slice(-indices.over) %>%
+  pull(stroke)
+```
+
+```{r Neural Network with oversampled data, message=FALSE, warning=FALSE, paged.print=FALSE}
+#oversample the train data
+set.seed(2)
+train.over <- ROSE(stroke ~., data = train, seed=3, p=0.5)$data
+# build the network
+stroke_net <- nnet(stroke ~ ., data = train.over, size=15, maxit=500, range=0.1,
+                   decay=5e-4, trace=FALSE)
+# make predictions
+pred <- predict(stroke_net, test_in, type="class")
+# calculate accuracy and precision
+conf_matrix<-confusionMatrix(as.factor(pred), as.factor(test_truth), positive="1")
+conf_matrix$byClass
+conf_matrix$table
+```
+
+The model seems to be more accurate than the one with the unbalanced data: its sensitivity is almost 60%, which is significantly higher than in the model before. However, only about 10% of patients classified as sick are actually sick. However a cross-validation is necessary to have more accurate results.
+
+\pagebreak
+
+
+##### **4.5.3 Cross-Validation Neural Network**
+\
+In the following, the Neural Networks that were built in the previous steps are cross-validated.
+
+```{r Cross-Validation of Neural Networks with unbalanced and oversampled data}
+set.seed(2)
+for(i in 1:30){
+  #Unbalanced
+  indices.cw <- createDataPartition(df$stroke, p=.7, list = F)
+  train <- df %>%
+    slice(indices.cw)
+  test_in <- df %>%
+    slice(-indices.cw) %>%
+    dplyr::select(-stroke)
+  test_truth <- df%>%
+    slice(-indices.cw) %>%
+    pull(stroke)
+  
+  stroke_net <- nnet(stroke ~ ., data = train, size=15, maxit=100, range=0.1, 
+                     decay=5e-4, trace=FALSE)
+  pred <- predict(stroke_net, test_in, type="class")
+  
+  conf_matrix <- confusionMatrix(as.factor(pred),as.factor(test_truth), positive="1")
+  ifelse(i==1, unbalanced <- conf_matrix$byClass, unbalanced <- unbalanced + conf_matrix$byClass)
+
+  #oversampled
+  indices.over <- createDataPartition(df$stroke, p=.7, list = F)
+  train <- df %>%
+    slice(indices.over)
+  test_in.over <- df %>%
+    slice(-indices.over) %>%
+    dplyr::select(-stroke)
+  test_truth.over <- df%>%
+    slice(-indices.over) %>%
+    pull(stroke)
+  
+  train.over <- ROSE(stroke ~., data = train, seed=3, p=0.5)$data
+  
+  stroke_net <- nnet(stroke ~ ., data = train.over, size=15, maxit=500, range=0.1,
+                     decay=5e-4,trace=FALSE)
+
+  pred <- predict(stroke_net, test_in.over, type="class")
+  
+  conf_matrix <- confusionMatrix(as.factor(pred),as.factor(test_truth.over), positive="1")
+  ifelse(i==1, over <- conf_matrix$byClass, over <- over + conf_matrix$byClass)
+}
+unbalanced/i
+over/i
+```
+
+The model trained with oversampled data performs much better than the one using unbalanced data, detecting 77% of patients who have had a stroke and almost 72% of healthy patients. The model trained with unbalanced data, on the other hand, only detects 4% of sick patients. Both models perform rather poorly in terms of how many of those classified as sick were actually sick. The "Pos Pred Value" of the model trained with unbalanced data (8%) is even lower than that of the model trained with oversampled data (12%).
+
+In conclusion, the best model for the Neural Network is the one using oversampled data, as it is the best in predicting strokes. 77.2% of the patients that had a stroke were predicted correctly while also 71.95% of the healthy patients were recognized as such.\
+
+#### **5. Conclusion of Models to Predict Strokes**
+
+In this project, different models were fitted to solve different problems. Since it would not have made sense to use a linear model for classification, it was used to impute missing BMIs. A Poisson regression was used to predict the number of strokes occurring in different age groups.\
+The rest of the models seen in class (logistic regression, GAM, SVM, and Neural Networks) were used to predict whether patients have had a stroke or not. Since they were all applied to the same problem, their performance can be compared.\
+
+The best performing GLM, which was the simple model trained with imbalanced data, correctly detected 87% of strokes, and 64% of healthy patients. 11.1% of patients for whom a stroke was predicted were indeed sick.\
+
+The best performing GAM, which was trained on oversampled data, had a much lower sensitivity of 61%, but a much higher specificity of almost 84%. With almost 16%, a higher share of patients that were predicted to have had a stroke did so as well.\
+
+The best performing SVM, which was trained on undersampled data of non-stroke patients using random splitting, correctly detected almost 85% of stroke patients, and almost 70% of healthy ones. However, only 12.5% of patients classified as having had a stroke did so in reality.\
+
+Lastly, the best performing Neural Network was the one using oversampled data, with a sensitivity of around 77%, and a specificity of about 72%. Yet, only around 12% of patients predicted to have had a stroke also had one.\
+
+This means that from all the models that were developed for this project, the SVM would be the one that would help doctors best screen their patients for stroke risk. It successfully detects 85% of stroke patients, but only 12.5% of all positive stroke predictions were accurate. Therefore, our models still require tweaking. It would simply be unfeasable for doctors to screen all the false positive patients.
+
+
+\pagebreak
+
+
+#### **6. Approximate Bayesian Computation to Find Fitting Model Predicting Spreading of a Disease/News**
+\
+We were given the following observed data for the 4-parameter logistic equation: a = 3, b = 2, c = 1143, and d = 1655.
+
+An Agent-Based Model (ABM) was used to simulate all combinations of between 40 and 100 agents and 1 to 20 pubs (due to issues with the required libraries, the result was obtained from the "summary_stat.csv" file that the teacher provided. However, after finding a duplicate simulation in the last row, it was omitted.
+The simulation parameters and data were then saved in two separate files, which were then re-read as a table, so they could be used for the Approximate Bayesian Computation (ABC). A non-linear regression (nnet) was used and the tolerance for the rejection algorithm was kept as low as possible while still being able to run the function. 
+```{r approx Bayesian Computation, message=FALSE, warning=FALSE}
+set.seed(5)
+# Create observed data and write it to obs_data.dat file
+obs_data <- as.data.frame(t(c(3, 2, 1143, 1655)))
+write.dat(obs_data, "dat files")
+# Load result of ABM simulations and check for duplicates
+summary_stat <- read.csv("summary_stat.csv", header = FALSE)
+duplicates <- summary_stat[duplicated(summary_stat$V1),]
+duplicates # row 1221 is a duplicate
+# Delete duplicate row
+summary_stat <- summary_stat[-c(1221),]
+
+# Save simulation parameters and data in .dat files
+sim_param <- summary_stat[,2:3]
+write.dat(sim_param, "dat files")
+sim_data <- summary_stat[,4:7]
+write.dat(sim_data, "dat files")
+
+# Import created .dat files
+obs_data  <- read.table(file="dat files/obs_data.dat",header=FALSE)
+sim_param <- read.table(file="dat files/sim_param.dat",header=FALSE)
+sim_data  <- read.table(file="dat files/sim_data.dat",header=FALSE)
+
+# Run ABC function with the observed data, simulation parameters, and simulation data
+res <-  abc(target=obs_data, param=sim_param, sumstat=sim_data, tol=0.00085, transf="log", method="neuralnet", trace = FALSE)
+
+# Plot the ABC model
+plot(res, param=sim_param)
+# Write the regression adjusted values to a .tsv file
+write.table(res$adj.values, "out_abc.tsv", sep="\t", row.name=FALSE)
+# Print regression adjusted values
+res$adj.values
+```
+The regression adjusted values obtained indicate that the simulations that best match the experimentally observed data were those with 67 agents and 16 pubs, as well as the one with 41 agents and 19 pubs. This can also be seen in the graphs which show the two peaks of the posterior parameter distributions at the abovementioned levels.\
+
